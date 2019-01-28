@@ -1,0 +1,222 @@
+﻿#pragma kernel BuildInitBoundTex
+#pragma kernel MarkSurface
+#pragma kernel BuildFirstQueue
+#pragma kernel DebugKernel
+#pragma kernel FIMCopyKernel
+#pragma kernel FIMLoopKernel
+#include "LiquidUtils.hlsl"
+#include "Liquid2DDef.hlsl"
+
+AppendStructuredBuffer<uint2> _ItrateListBuffer;
+RWTexture2D<float> _SDFWrite;
+RWTexture2D<uint> _BoundTex;
+RWTexture2D<float> _SDFRead;
+uint _ResolutionX;
+uint _ResolutionY;
+
+// kernel0
+[numthreads(1, 1, 1)]
+void BuildInitBoundTex(uint2 id : SV_GroupID)
+{
+	uint2 coord = id.xy + uint2(1, 1);
+	_BoundTex[coord] = 0;
+	float t = _SDFRead[coord];
+	//if (t > 1)
+	//	_SDFRead[coord] = INFINITY;
+	//else if (t < -1)
+	//	_SDFRead[coord] = -INFINITY;
+}
+
+bool NeighborIsLiquidSurf(RWTexture2D<uint> boundTex, RWTexture2D<float> readTex, float centerVal, uint2 neighborIndex) {
+	if (GetBoundary2D(boundTex, neighborIndex, BOUND_TEX_IS_BOUNDARY))
+		return false;
+	return centerVal * readTex[neighborIndex] <= 0;
+}
+
+// kernel1
+[numthreads(1, 1, 1)]
+void MarkSurface(uint2 id : SV_GroupID)
+{
+	uint2 uvIndex0 = id + uint2(1, 1);
+	uint2 uvIndex1 = uvIndex0 + uint2(1, 0);
+	uint2 uvIndex2 = uvIndex0 + uint2(0, 1);
+	uint2 uvIndex3 = uvIndex0 + uint2(-1, 0);
+	uint2 uvIndex4 = uvIndex0 + uint2(0, -1);
+	float centerSDFVal = _SDFRead[uvIndex0];
+	bool isLiquidSurf = false;
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex1);
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex2);
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex3);
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex4);
+
+	SetBoundary2D(_BoundTex, uvIndex0, isLiquidSurf, BOUND_TEX_IS_KNOWN);
+	SetBoundary2D(_BoundTex, uvIndex0, isLiquidSurf, BOUND_TEX_QUEUE_COMPLETED);
+
+	if (!isLiquidSurf) {
+		// reset SDF val
+		float t = _SDFRead[uvIndex0];
+		if (t > 0)
+			_SDFRead[uvIndex0] = INFINITY;
+		else
+			_SDFRead[uvIndex0] = -INFINITY;
+	}
+}
+
+void DilatePixelSDF(RWTexture2D<uint> boundTex, RWTexture2D<float> SDFRead, RWTexture2D<float> SDFWrite, uint2 pixelCoord, AppendStructuredBuffer<uint2> target) {
+	if (GetBoundary2D(_BoundTex, pixelCoord, BOUND_TEX_IS_BOUNDARY))
+		return;
+	uint tag = 0;
+	uint mask = GetBoundary2DMask(BOUND_TEX_QUEUE_COMPLETED);
+	InterlockedOr(_BoundTex[pixelCoord], mask, tag);
+	bool hasAlreadyQueued = (tag & mask) > 0;
+	if (hasAlreadyQueued) {
+		//SDFWrite[pixelCoord] = -100000;
+		return;
+	}
+
+	target.Append(pixelCoord);
+
+	//uint bufferIndex;
+	//InterlockedAdd(_ItrateListArgBuffer[0], 1, bufferIndex);
+	//_ItrateListBuffer[bufferIndex] = pixelCoord;
+}
+
+// kernel2
+[numthreads(1, 1, 1)]
+void BuildFirstQueue(uint2 id : SV_GroupID)
+{
+	uint2 uvIndex0 = id + uint2(1, 1);
+	uint2 uvIndex1 = uvIndex0 + uint2(1, 0);
+	uint2 uvIndex2 = uvIndex0 + uint2(0, 1);
+	uint2 uvIndex3 = uvIndex0 + uint2(-1, 0);
+	uint2 uvIndex4 = uvIndex0 + uint2(0, -1);
+
+	_SDFWrite[uvIndex0] = _SDFRead[uvIndex0];
+	if (!GetBoundary2D(_BoundTex, uvIndex0, BOUND_TEX_IS_KNOWN))
+		return;
+
+	//_SDFWrite[uvIndex0] = INFINITY + 1;
+	uint tag = 0;
+	DilatePixelSDF(_BoundTex, _SDFRead, _SDFWrite, uvIndex1, _ItrateListBuffer);
+	DilatePixelSDF(_BoundTex, _SDFRead, _SDFWrite, uvIndex2, _ItrateListBuffer);
+	DilatePixelSDF(_BoundTex, _SDFRead, _SDFWrite, uvIndex3, _ItrateListBuffer);
+	DilatePixelSDF(_BoundTex, _SDFRead, _SDFWrite, uvIndex4, _ItrateListBuffer);
+
+}
+
+StructuredBuffer<uint2> _ItrateListBufferRead;
+
+// kernel3
+[numthreads(1, 1, 1)]
+void DebugKernel(uint id : SV_GroupID)
+{
+	uint2 index = _ItrateListBufferRead[id];
+	_SDFWrite[index] = -100000;
+}
+
+void TryAddNeighbor(uint2 coord, AppendStructuredBuffer<uint2> target) {
+	uint tag = 0;
+	uint mask = GetBoundary2DMask(BOUND_TEX_QUEUE_COMPLETED);
+	InterlockedOr(_BoundTex[coord], mask, tag);
+	bool hasAlreadyQueued = (tag & mask) > 0;
+	if (!hasAlreadyQueued) {
+		target.Append(coord);
+	}
+}
+
+void FIMLoop(uint id, StructuredBuffer<uint2> list, RWTexture2D<float> sdfRead, RWTexture2D<float> sdfWrite, AppendStructuredBuffer<uint2> targetList) {
+	float sdfs[] = { INFINITY , INFINITY , INFINITY , INFINITY };
+	uint2 uvIndex0 = list[id];
+	uint2 uvIndex1 = uvIndex0 + uint2(1, 0);
+	uint2 uvIndex2 = uvIndex0 + uint2(0, 1);
+	uint2 uvIndex3 = uvIndex0 + uint2(-1, 0);
+	uint2 uvIndex4 = uvIndex0 + uint2(0, -1);
+
+	bool isBound1 = GetBoundary2D(_BoundTex, uvIndex1, BOUND_TEX_IS_BOUNDARY);
+	bool isBound2 = GetBoundary2D(_BoundTex, uvIndex2, BOUND_TEX_IS_BOUNDARY);
+	bool isBound3 = GetBoundary2D(_BoundTex, uvIndex3, BOUND_TEX_IS_BOUNDARY);
+	bool isBound4 = GetBoundary2D(_BoundTex, uvIndex4, BOUND_TEX_IS_BOUNDARY);
+
+	bool isKnown1 = GetBoundary2D(_BoundTex, uvIndex1, BOUND_TEX_IS_KNOWN);
+	bool isKnown2 = GetBoundary2D(_BoundTex, uvIndex2, BOUND_TEX_IS_KNOWN);
+	bool isKnown3 = GetBoundary2D(_BoundTex, uvIndex3, BOUND_TEX_IS_KNOWN);
+	bool isKnown4 = GetBoundary2D(_BoundTex, uvIndex4, BOUND_TEX_IS_KNOWN);
+
+	sdfs[0] = (isKnown1 ? sdfRead[uvIndex1] : INFINITY);
+	sdfs[1] = (isKnown2 ? sdfRead[uvIndex2] : INFINITY);
+	sdfs[2] = (isKnown3 ? sdfRead[uvIndex3] : INFINITY);
+	sdfs[3] = (isKnown4 ? sdfRead[uvIndex4] : INFINITY);
+
+	// get lowest 2 vals
+	float lowest0 = INFINITY;
+	float lowest1 = INFINITY;
+	uint lowestid0 = -1;
+	uint lowestid1 = -1;
+	// process sign
+	float sign = 1;
+	if (sdfs[0] < -EPS || sdfs[1] < -EPS || sdfs[2] < -EPS || sdfs[3] < -EPS) {
+		//if (sdfs[0] < -EPS) {
+		sign = -1;
+		sdfs[0] = abs(sdfs[0]);
+		sdfs[1] = abs(sdfs[1]);
+		sdfs[2] = abs(sdfs[2]);
+		sdfs[3] = abs(sdfs[3]);
+	}
+	for (int i = 0; i < 4; ++i) {
+		if (lowest0 > sdfs[i]) {
+			lowestid0 = i;
+			lowest0 = sdfs[i];
+		}
+	}
+	sdfs[lowestid0] = INFINITY;
+	for (int i = 0; i < 4; ++i) {
+		if (lowest1 > sdfs[i]) {
+			lowestid1 = i;
+			lowest1 = sdfs[i];
+		}
+	}
+
+	float a = lowest0;
+	float b = lowest1;
+	float result = 0;
+	if (b - a >= 1) {
+		result = (a + 1);
+	}
+	else {
+		result = ((a + b + sqrt(2 - (a - b) * (a - b)))* 0.5);
+	}
+	
+	// this condition require blit between two textures, if just use one texture RW, this will cause sychronized problem
+	if (abs(sdfRead[uvIndex0]) - result > 0.01) {
+		sdfWrite[uvIndex0] = sign * result;
+		targetList.Append(uvIndex0);
+		SetBoundary2D(_BoundTex, uvIndex0, true, BOUND_TEX_IS_KNOWN);
+
+		// queue neighbors, have synchronize problem
+		if (!isBound1)	TryAddNeighbor(uvIndex1, targetList);
+		if (!isBound2)	TryAddNeighbor(uvIndex2, targetList);
+		if (!isBound3)	TryAddNeighbor(uvIndex3, targetList);
+		if (!isBound4)	TryAddNeighbor(uvIndex4, targetList);
+	//sdfWrite[uvIndex0] = 10;
+	}
+	// set new val, requeue this node, set known
+
+}
+
+AppendStructuredBuffer<uint2> _ItrateListBufferNew;
+
+// kernel4
+[numthreads(1, 1, 1)]
+void FIMCopyKernel(uint2 id : SV_GroupID)
+{
+	uint2 coord = id + uint2(1, 1);
+	_SDFWrite[id] = _SDFRead[id];
+}
+
+// kernel5
+[numthreads(1, 1, 1)]
+void FIMLoopKernel(uint id : SV_GroupID)
+{
+	// calc current tile sdf
+	FIMLoop(id, _ItrateListBufferRead, _SDFRead, _SDFWrite, _ItrateListBufferNew);
+}

@@ -1,0 +1,223 @@
+﻿#pragma kernel InitSDFKernel
+#pragma kernel SweepingKernel
+#include "LiquidUtils.hlsl"
+#include "Liquid2DDef.hlsl"
+
+AppendStructuredBuffer<uint3> _ItrateListBuffer;
+StructuredBuffer<uint3> _ItrateListBufferRead;
+AppendStructuredBuffer<uint3> _ItrateListBufferNew;
+RWTexture2D<float> _SDFWrite;
+RWTexture2D<uint> _BoundTex;
+RWTexture2D<float> _SDFRead;
+uint _ResolutionX;
+uint _ResolutionY;
+
+bool NeighborIsLiquidSurf(RWTexture2D<uint> boundTex, RWTexture2D<float> readTex, float centerVal, uint2 neighborIndex) {
+	if (GetBoundary2D(boundTex, neighborIndex, BOUND_TEX_IS_BOUNDARY))
+		return false;
+	return centerVal * readTex[neighborIndex] <= 0;
+}
+
+// kernel0
+[numthreads(1, 1, 1)]
+void InitSDFKernel(uint2 id : SV_GroupID)
+{
+	uint2 uvIndex0 = id + uint2(1, 1);
+	uint2 uvIndex1 = uvIndex0 + uint2(1, 0);
+	uint2 uvIndex2 = uvIndex0 + uint2(0, 1);
+	uint2 uvIndex3 = uvIndex0 + uint2(-1, 0);
+	uint2 uvIndex4 = uvIndex0 + uint2(0, -1);
+	float centerSDFVal = _SDFRead[uvIndex0];
+	bool isLiquidSurf = false;
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex1);
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex2);
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex3);
+	isLiquidSurf = isLiquidSurf || NeighborIsLiquidSurf(_BoundTex, _SDFRead, centerSDFVal, uvIndex4);
+
+	uint boundTag = 0;
+	if (!isLiquidSurf) {
+		float t = _SDFRead[uvIndex0];
+		// reset SDF val
+		if (t > 0)
+			_SDFRead[uvIndex0] = INFINITY;
+		else
+			_SDFRead[uvIndex0] = -INFINITY;
+	}
+	else {
+		boundTag = GetBoundary2DMask(BOUND_TEX_IS_KNOWN);
+	}
+	_BoundTex[uvIndex0] = boundTag;
+
+	// if resolutionX or resolutionY is not odd, dilate right 1 grid, dilate down 1 grid
+	// build first queue
+	if (id.x == 0) {
+		// left up corner, dir = right
+		if (id.y == 0) {
+			_ItrateListBuffer.Append(uint3(uvIndex0, SWEEPING_DIR_RIGHT_DOWN));
+		}
+		// left down corner, dir = up
+		if (id.y == _ResolutionY - 1) {
+			if (_ResolutionY % 2 == 1)
+				uvIndex0 = uvIndex0 + uint2(0, 1);
+			_ItrateListBuffer.Append(uint3(uvIndex0, SWEEPING_DIR_RIGHT_UP));
+		}
+	}
+	else if (id.x == _ResolutionX - 1) {
+		// right up corner, dir = down
+		if (id.y == 0) {
+			if (_ResolutionX % 2 == 1)
+				uvIndex0 = uvIndex0 + uint2(1, 0);
+			_ItrateListBuffer.Append(uint3(uvIndex0, SWEEPING_DIR_LEFT_DOWN));
+		}
+		// right down corner, dir = left
+		if (id.y == _ResolutionY - 1) {
+			if (_ResolutionX % 2 == 1)
+				uvIndex0 = uvIndex0 + uint2(1, 0);
+			if (_ResolutionY % 2 == 1)
+				uvIndex0 = uvIndex0 + uint2(0, 1);
+			_ItrateListBuffer.Append(uint3(uvIndex0, SWEEPING_DIR_LEFT_UP));
+		}
+	}
+}
+
+static uint2 NextNeighborOffset1[4] = {
+	uint2(1,0),
+	uint2(-1,0),
+	uint2(0,-1),
+	uint2(0,1),
+};
+
+static uint2 NextNeighborOffset2[4] = {
+	uint2(0,1),
+	uint2(0,-1),
+	uint2(1,0),
+	uint2(-1,0),
+};
+
+static uint2 BackNeighborOffset1[4] = {
+	uint2(-1,0),
+	uint2(1,0),
+	uint2(0,1),
+	uint2(0,-1),
+};
+
+static uint2 BackNeighborOffset2[4] = {
+	uint2(0,-1),
+	uint2(0,1),
+	uint2(-1,0),
+	uint2(1,0),
+};
+
+static uint FSM_HAS_QUEUED[4] = {
+	FSM_SWEEPING_QUEUE0_COMPLETED,
+	FSM_SWEEPING_QUEUE1_COMPLETED,
+	FSM_SWEEPING_QUEUE2_COMPLETED,
+	FSM_SWEEPING_QUEUE3_COMPLETED,
+};
+
+float CalcSDF(float val0, float val1, float origin) {
+	bool val0IsInf = isInf(val0);
+	bool val1IsInf = isInf(val1);
+	if (val0IsInf) {
+		if (val1IsInf) {
+			return origin;
+		}
+		else {
+			if (val1 > 0)
+				return val1 + 1;
+			else
+				return val1 - 1;
+		}
+	}
+	else {
+		if (val1IsInf) {
+			if (val0 > 0)
+				return val0 + 1;
+			else
+				return val0 - 1;
+		}
+	}
+
+	float sign = 1;
+	if (val0 < 0) {
+		sign = -1;
+		val0 = -val0;
+		val1 = -val1;
+	}
+	if (abs(val0 - val1) > 1) {
+		return sign * (min(val0, val1) + 1);
+	}
+
+	return ((val0 + val1 + sqrt(2 - (val0 - val1) * (val0 - val1)))* 0.5) * sign;
+}
+
+void AddPosToQueue(uint2 pos, uint dir, AppendStructuredBuffer<uint3> target, uint completeBit) {
+	if (GetBoundary2D(_BoundTex, pos, BOUND_TEX_IS_BOUNDARY) == 0) {
+		uint tag = 0;
+		uint mask = GetBoundary2DMask(completeBit);
+		InterlockedOr(_BoundTex[pos], mask, tag);
+		bool hasAlreadyQueued = (tag & mask) > 0;
+		if (!hasAlreadyQueued) {
+			target.Append(uint3(pos, dir));
+		}
+	}
+}
+
+// kernel1
+[numthreads(1, 1, 1)]
+void SweepingKernel(uint id : SV_GroupID)
+{
+	uint3 data = _ItrateListBufferRead[id];
+	uint2 uvIndex0 = data.xy;
+	uint dir = data.z;
+
+	//if (GetBoundary2D(_BoundTex, uvIndex0, BOUND_TEX_IS_BOUNDARY) > 0)
+	//	_SDFRead[uvIndex0] = 10;
+
+	// enqueue next point
+	AddPosToQueue(uvIndex0 + NextNeighborOffset1[dir], dir, _ItrateListBufferNew, FSM_HAS_QUEUED[dir]);
+	AddPosToQueue(uvIndex0 + NextNeighborOffset2[dir], dir, _ItrateListBufferNew, FSM_HAS_QUEUED[dir]);
+
+	// surface and bound point should not recalc sdf
+	if (GetBoundary2D(_BoundTex, uvIndex0, BOUND_TEX_IS_KNOWN) != 0 || GetBoundary2D(_BoundTex, uvIndex0, BOUND_TEX_IS_BOUNDARY) > 0) {
+		return;
+	}
+	
+	// calc current grid val
+	uint2 neighborIndex0 = uvIndex0 + BackNeighborOffset1[dir];
+	uint2 neighborIndex1 = uvIndex0 + BackNeighborOffset2[dir];
+	float neighborVal0 = _SDFRead[neighborIndex0];
+	float neighborVal1 = _SDFRead[neighborIndex1];
+	float oriVal = _SDFRead[uvIndex0];
+
+	float sdfval = CalcSDF(neighborVal0, neighborVal1, oriVal);
+	float targetval;
+	if ((sdfval > 0 && sdfval < oriVal)) {
+		InterlockedExchange(_SDFRead[uvIndex0], sdfval, targetval);
+		if (sdfval > targetval) {
+			sdfval = targetval;
+			InterlockedExchange(_SDFRead[uvIndex0], sdfval, targetval);
+		}
+	}
+	else if (sdfval < 0 && sdfval > oriVal) {
+		InterlockedExchange(_SDFRead[uvIndex0], sdfval, targetval);
+		if (sdfval < targetval) {
+			sdfval = targetval;
+			InterlockedExchange(_SDFRead[uvIndex0], sdfval, targetval);
+		}
+	}
+	// shader mode 5.0 only support interlockedmin and max to uint or int
+	// out of water surface
+	///float curval = _SDFRead[uvIndex0];
+	///float t = 0;
+	///if (curval > 0) {
+	///	if (sdfval > 0) {
+	///		InterlockedMin(_SDFRead[uvIndex0], sdfval, t);
+	///	}
+	///}
+	///else {
+	///	if (sdfval < 0) {
+	///		InterlockedMax(_SDFRead[uvIndex0], sdfval, t);
+	///	}
+	///} 
+}

@@ -1,0 +1,47 @@
+﻿#pragma kernel BuildBoundTex
+#pragma kernel BuildSourceTex
+#define INFINITY 1000000.0
+#include "LiquidUtils.hlsl"
+#include "Liquid2DDef.hlsl"
+
+RWTexture2D<uint> _BoundTex;
+RWTexture2D<float> _SDFTarget;
+uint _ResolutionX;
+uint _ResolutionY;
+
+[numthreads(1,1,1)]
+void BuildBoundTex(uint2 id : SV_GroupID)
+{
+	uint val = 0;
+
+	bool isBoundary = (id.x == 0 || id.x == _ResolutionX - 1 || id.y == 0 || id.y == _ResolutionY - 1);
+	SetBoundary2D(_BoundTex, id.xy, isBoundary, BOUND_TEX_IS_BOUNDARY);
+	_SDFTarget[id.xy] = INFINITY;
+}
+
+float4 _EmitCircle;
+[numthreads(1, 1, 1)]
+void BuildSourceTex(uint2 id : SV_GroupID)
+{
+	float2 emitCenter = _EmitCircle.xy;
+	float emitRadius = _EmitCircle.w;
+
+	float orival = _SDFTarget[id.xy];
+	float2 curPos = float2(id.x, id.y);
+	float2 circleCenter = float2((_ResolutionX - 1) * emitCenter.x, (_ResolutionY - 1) * emitCenter.y);
+	float curval = DistanceVec2(curPos, circleCenter) - emitRadius;
+	float val = min(orival, curval);
+	//if (abs(orival) > abs(curval))
+	//	val = curval;
+	//else
+	//	val = orival;
+	
+	
+	if (val > 0.999)
+		_SDFTarget[id.xy] = INFINITY;
+	else if (val < -0.999)
+		_SDFTarget[id.xy] = -INFINITY;
+	else
+		_SDFTarget[id.xy] = val;
+	//_SDFTarget[id.xy] = abs(val) > 2?100000:val;
+}
